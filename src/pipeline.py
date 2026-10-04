@@ -29,8 +29,11 @@ def build_pipeline():
     print("\n[1/4] Chunking documents...", flush=True)
     docs = load_documents()
     all_chunks = []
+    parent_map: dict[str, str] = {}  # "source::parent_id" -> parent text (retrieve child → return parent)
     for doc in docs:
         parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
+        for p in parents:
+            parent_map[f"{doc['metadata']['source']}::{p.metadata['parent_id']}"] = p.text
         for child in children:
             all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
     print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
@@ -58,7 +61,14 @@ def build_pipeline():
     reranker = CrossEncoderReranker()
     print(f"  ✓ Reranker ready ({time.time()-t0:.1f}s)", flush=True)
 
+    search.parent_map = parent_map
     return search, reranker
+
+
+def _to_parent(r_text: str, metadata: dict, search: HybridSearch) -> str:
+    """Child → parent text để LLM có đủ ngữ cảnh; fallback về child nếu không có parent."""
+    key = f"{metadata.get('source', '')}::{metadata.get('parent_id', '')}"
+    return getattr(search, "parent_map", {}).get(key, r_text)
 
 
 def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str]]:
@@ -66,7 +76,12 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
     results = search.search(query)
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+    top = reranked if reranked else results[:3]
+    contexts = []
+    for r in top:
+        ctx = _to_parent(r.text, r.metadata, search)
+        if ctx not in contexts:  # nhiều child cùng parent → chỉ giữ 1 lần
+            contexts.append(ctx)
 
     from config import OPENAI_API_KEY
     if OPENAI_API_KEY and contexts:
@@ -75,9 +90,9 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
             client = OpenAI()
             context_str = "\n\n".join(contexts)
             resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
+                {"role": "system", "content": "Trả lời CHỈ dựa trên context, ngắn gọn, đi thẳng vào câu hỏi. Nếu context có nhiều phiên bản quy định, dùng bản mới/hiện hành nhất. Chỉ nói 'Không tìm thấy.' khi context hoàn toàn không có thông tin liên quan."},
                 {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
-            ])
+            ], temperature=0)
             answer = resp.choices[0].message.content
         except Exception as e:
             print(f"  ⚠️  LLM generation failed: {e}", flush=True)
